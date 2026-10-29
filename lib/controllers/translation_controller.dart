@@ -218,12 +218,7 @@ class TranslationController extends ChangeNotifier {
           );
           await cameraController!.unlockCaptureOrientation();
         } catch (_) {}
-        // Continuous AF/AE — some devices park focus after initialization,
-        // which makes the feed hunt or stay soft.
-        try {
-          await cameraController!.setFocusMode(FocusMode.auto);
-          await cameraController!.setExposureMode(ExposureMode.auto);
-        } catch (_) {}
+        // Use default camera behavior — no focus/exposure mode overrides
         _applyLensInfo(activeCamera!);
         // Rolling copy of the newest preview frame so captures are
         // effectively free — essential for tracking continuous signing.
@@ -298,10 +293,7 @@ class TranslationController extends ChangeNotifier {
       _latestImage = null;
       _lastDecoded = null;
       localGuess = null;
-      try {
-        await controller.setFocusMode(FocusMode.auto);
-        await controller.setExposureMode(ExposureMode.auto);
-      } catch (_) {}
+      // Use default camera behavior — no focus/exposure mode overrides
       await controller.startImageStream(_onStreamFrame);
     } catch (e) {
       // The in-place swap failed — rebuild the camera cleanly rather than

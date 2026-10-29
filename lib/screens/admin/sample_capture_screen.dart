@@ -67,8 +67,7 @@ class _SampleCaptureScreenState extends State<SampleCaptureScreen> {
     try {
       await _cam!.lockCaptureOrientation(DeviceOrientation.portraitUp);
       await _cam!.unlockCaptureOrientation();
-      await _cam!.setFocusMode(FocusMode.auto);
-      await _cam!.setExposureMode(ExposureMode.auto);
+      // Use default camera behavior — no focus/exposure mode overrides
     } catch (_) {}
     await _cam!.startImageStream(_onFrame);
     if (mounted) setState(() {});

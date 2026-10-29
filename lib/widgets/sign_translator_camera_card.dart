@@ -93,10 +93,7 @@ class _SignTranslatorCameraCardState extends State<SignTranslatorCameraCard>
       // without touching orientation mid-session.
       await newController.lockCaptureOrientation(DeviceOrientation.portraitUp);
       await newController.unlockCaptureOrientation();
-      try {
-        await newController.setFocusMode(FocusMode.auto);
-        await newController.setExposureMode(ExposureMode.auto);
-      } catch (_) {}
+      // Use default camera behavior — no focus/exposure mode overrides
 
       if (mounted) {
         setState(() {
