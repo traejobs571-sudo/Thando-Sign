@@ -1,0 +1,9 @@
+{
+  // supabase/schema.sql is PostgreSQL (Supabase), not T-SQL — stop the
+  // mssql extension flagging valid Postgres syntax as errors.
+  "mssql.intelliSense.enableIntelliSense": false,
+  "files.associations": {
+    "*.sql": "sql"
+  },
+  "python.terminal.useEnvFile": true
+}

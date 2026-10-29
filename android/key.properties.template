@@ -1,0 +1,11 @@
+# Copy this file to android/key.properties and fill in your keystore details.
+#
+# Generate a keystore (one-time):
+#   keytool -genkey -v -keystore C:\keys\thando-release.jks -keyalg RSA -keysize 2048 -validity 10000 -alias thando
+#
+# key.properties is git-ignored — never commit it or the keystore.
+
+storeFile=C:\\keys\\thando-release.jks
+storePassword=YOUR_STORE_PASSWORD
+keyAlias=thando
+keyPassword=YOUR_KEY_PASSWORD
