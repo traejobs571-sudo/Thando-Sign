@@ -164,6 +164,24 @@ class _UsersTabState extends State<UsersTab> {
                       fontSize: 12,
                     ),
                   ),
+                  const SizedBox(height: 2),
+                  Row(
+                    children: [
+                      Icon(
+                        Icons.translate,
+                        size: 12,
+                        color: Colors.white.withValues(alpha: 0.4),
+                      ),
+                      const SizedBox(width: 4),
+                      Text(
+                        '${u.translationCount} translations',
+                        style: TextStyle(
+                          color: Colors.white.withValues(alpha: 0.5),
+                          fontSize: 11,
+                        ),
+                      ),
+                    ],
+                  ),
                   if (!u.isActive)
                     const Padding(
                       padding: EdgeInsets.only(top: 2),

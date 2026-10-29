@@ -6,6 +6,7 @@ class User {
   final String role;
   final bool isActive;
   final bool mustChangePassword;
+  final int translationCount;
   final DateTime createdAt;
 
   const User({
@@ -16,6 +17,7 @@ class User {
     this.role = 'user',
     this.isActive = true,
     this.mustChangePassword = false,
+    this.translationCount = 0,
     required this.createdAt,
   });
 
@@ -27,6 +29,7 @@ class User {
     'role': role,
     'is_active': isActive ? 1 : 0,
     'must_change_password': mustChangePassword ? 1 : 0,
+    'translation_count': translationCount,
     'created_at': createdAt.toIso8601String(),
   };
 
@@ -38,6 +41,7 @@ class User {
     role: map['role'] as String? ?? 'user',
     isActive: (map['is_active'] as int? ?? 1) == 1,
     mustChangePassword: (map['must_change_password'] as int? ?? 0) == 1,
+    translationCount: (map['translation_count'] as num?)?.toInt() ?? 0,
     createdAt: DateTime.parse(map['created_at'] as String),
   );
 }

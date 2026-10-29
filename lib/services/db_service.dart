@@ -20,7 +20,7 @@ class DbService {
   DbService({this._dbName = 'thando_sign.db'});
 
   final String _dbName;
-  static const _dbVersion = 5;
+  static const _dbVersion = 6;
   static const _uuid = Uuid();
 
   final _bcrypt = DBCrypt();
@@ -63,6 +63,7 @@ class DbService {
             must_change_password INTEGER NOT NULL DEFAULT 0,
             reset_code TEXT,
             reset_expires TEXT,
+            translation_count INTEGER NOT NULL DEFAULT 0,
             created_at TEXT NOT NULL
           )
         ''');
@@ -174,6 +175,9 @@ class DbService {
               attempts INTEGER NOT NULL DEFAULT 0
             )
           ''');
+        }
+        if (oldVersion < 6) {
+          await db.execute('ALTER TABLE users ADD COLUMN translation_count INTEGER NOT NULL DEFAULT 0');
         }
       },
       onOpen: (db) async {
@@ -1451,6 +1455,10 @@ class DbService {
       ...record.toMap(),
       'uuid': rowUuid,
     });
+    await db.rawUpdate(
+      'UPDATE users SET translation_count = translation_count + 1 WHERE id = ?',
+      [record.userId],
+    );
     final userRows = await db.query(
       'users',
       columns: ['email'],
