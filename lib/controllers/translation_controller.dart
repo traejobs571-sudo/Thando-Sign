@@ -201,7 +201,7 @@ class TranslationController extends ChangeNotifier {
         );
         cameraController = CameraController(
           activeCamera!,
-          ResolutionPreset.high,
+          ResolutionPreset.medium,
           enableAudio: false,
           imageFormatGroup: ImageFormatGroup.yuv420,
         );

@@ -69,8 +69,8 @@ class _SignTranslatorCameraCardState extends State<SignTranslatorCameraCard>
     final previousController = _controller;
     final CameraController newController = CameraController(
       widget.cameras[cameraIndex],
-      ResolutionPreset.high, // Avoid 'max'/'ultraHigh' — some Androids glitch.
-      enableAudio: false, // Sign-language translation doesn't need audio.
+      ResolutionPreset.medium,
+      enableAudio: false,
       imageFormatGroup: Platform.isAndroid
           ? ImageFormatGroup.nv21
           : ImageFormatGroup.bgra8888,
