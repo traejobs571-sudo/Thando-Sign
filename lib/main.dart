@@ -15,7 +15,9 @@ import 'screens/main/main_shell.dart';
 import 'services/auth_service.dart';
 import 'services/backup_service.dart';
 import 'services/connectivity_service.dart';
+import 'services/cloud_stt_service.dart';
 import 'services/db_service.dart';
+import 'services/duck_ai_service.dart';
 import 'services/gemini_service.dart';
 import 'services/gesture_image_service.dart';
 import 'services/settings_service.dart';
@@ -54,11 +56,14 @@ Future<void> main() async {
   final auth = AuthService(db, supabase, conn);
   await auth.init();
   final gemini = GeminiService();
+  final duckAi = DuckAiService(supabase: supabase);
+  final cloudStt = CloudSttService(supabase: supabase);
   final images = GestureImageService(
     db: db,
     supabase: supabase,
     gemini: gemini,
     auth: auth,
+    duckAi: duckAi,
   );
   final sync = SyncService(
     db: db,
@@ -120,9 +125,13 @@ Future<void> main() async {
         Provider<BackupService>.value(value: backup),
         ChangeNotifierProvider<AppSettings>.value(value: settings),
         Provider<GeminiService>.value(value: gemini),
+        Provider<DuckAiService>.value(value: duckAi),
+        Provider<CloudSttService>.value(value: cloudStt),
         Provider<GestureImageService>.value(value: images),
         Provider<TtsService>.value(value: tts),
-        ChangeNotifierProvider(create: (_) => SpeechService()),
+        ChangeNotifierProvider(
+          create: (_) => SpeechService()..setCloudStt(cloudStt),
+        ),
         ChangeNotifierProvider<AuthService>.value(value: auth),
         ChangeNotifierProvider(
           create: (_) => TranslationController(

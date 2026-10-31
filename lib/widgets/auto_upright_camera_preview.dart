@@ -86,15 +86,6 @@ class _AutoUprightCameraPreviewState extends State<AutoUprightCameraPreview> {
         final isFront = controller.description.lensDirection ==
             CameraLensDirection.front;
 
-        Widget preview = controller.buildPreview();
-        if (isFront) {
-          preview = Transform.scale(
-            scaleX: -1,
-            alignment: Alignment.center,
-            child: preview,
-          );
-        }
-
         // Cancel the plugin's (display − ui) correction: add back the
         // reported UI orientation, subtract the real physical orientation.
         var correction =
@@ -104,18 +95,30 @@ class _AutoUprightCameraPreviewState extends State<AutoUprightCameraPreview> {
         // clockwise — counter-rotate by one turn for the recording window.
         if (value.isRecordingVideo) correction -= 1;
 
-        return SizedBox.expand(
-          child: FittedBox(
-            fit: BoxFit.cover,
-            child: RotatedBox(
-              quarterTurns: correction,
-              child: SizedBox(
-                width: size.width,
-                height: size.height,
-                child: preview,
-              ),
-            ),
+        Widget child = RotatedBox(
+          quarterTurns: correction,
+          child: SizedBox(
+            width: size.width,
+            height: size.height,
+            child: controller.buildPreview(),
           ),
+        );
+        // The front lens follows the exact same rotation logic as the
+        // back camera first (correction + recording compensation), then
+        // gets its mirror flip in DISPLAY space — mirroring the already-
+        // upright image. Mirroring inside the RotatedBox instead makes
+        // the horizontal flip become a vertical flip once the feed is
+        // rotated 90°, so the front preview stops matching the back.
+        if (isFront) {
+          child = Transform.scale(
+            scaleX: -1,
+            alignment: Alignment.center,
+            child: child,
+          );
+        }
+
+        return SizedBox.expand(
+          child: FittedBox(fit: BoxFit.cover, child: child),
         );
       },
     );

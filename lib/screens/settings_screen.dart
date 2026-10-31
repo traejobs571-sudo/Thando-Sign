@@ -120,7 +120,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                         style: TextStyle(color: Colors.white, fontSize: 14),
                       ),
                       subtitle: Text(
-                        'Read each translation aloud as soon as it is recognised',
+                        'Read each translation aloud as soon as it is recognised — including live captions while a session is recording',
                         style: TextStyle(
                           color: Colors.white.withValues(alpha: 0.55),
                           fontSize: 12,

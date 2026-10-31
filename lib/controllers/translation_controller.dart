@@ -107,6 +107,10 @@ class TranslationController extends ChangeNotifier {
   /// real time.
   String liveTranscript = '';
 
+  /// Sign labels recognised so far in the active session, in order —
+  /// powers the live sign strip rendered under the transcript.
+  List<String> liveSigns = const [];
+
   /// Short reason when a live segment can't be determined — surfaced so
   /// the signer knows what to fix (hand left the frame, blur, etc).
   String liveStatus = '';
@@ -486,7 +490,20 @@ class TranslationController extends ChangeNotifier {
             : snapped.note;
       } else {
         liveStatus = '';
+        final before = liveTranscript;
         liveTranscript = mergeLiveSegment(liveTranscript, snapped.english);
+        // The newly appended words are spoken aloud right away — live
+        // captions the hearing person can hear, not just read.
+        final tail = liveTranscript.length > before.length
+            ? liveTranscript.substring(before.length).trim()
+            : '';
+        liveSigns = mergeLiveSigns(
+          liveSigns,
+          tokenizeSignLabels(snapped.gesture, _vocabulary),
+        );
+        if (tail.isNotEmpty && settings.autoSpeak) {
+          unawaited(tts.speakLive(tail));
+        }
       }
       notifyListeners();
     } catch (_) {
@@ -518,6 +535,73 @@ class TranslationController extends ChangeNotifier {
         ? segWords.sublist(overlap).join(' ')
         : '';
     return tail.isEmpty ? cur : '$cur $tail';
+  }
+
+  /// List version of [mergeLiveSegment]: drops the longest suffix of
+  /// [current] that reappears as a prefix of [segment], so overlapping
+  /// capture windows don't double-count the same sign.
+  static List<String> mergeLiveSigns(
+    List<String> current,
+    List<String> segment,
+  ) {
+    if (segment.isEmpty) return current;
+    if (current.isEmpty) return List.of(segment);
+    var overlap = math.min(current.length, segment.length);
+    while (overlap > 0) {
+      if (listEquals(
+        current.sublist(current.length - overlap),
+        segment.sublist(0, overlap),
+      )) {
+        break;
+      }
+      overlap--;
+    }
+    return [...current, ...segment.sublist(overlap)];
+  }
+
+  /// Splits a space-joined GESTURE response into sign labels — greedy
+  /// longest-match against [vocabulary] so multi-word labels like
+  /// "Thank You" stay whole; unmatched words pass through as single
+  /// tokens so the UI can still show a placeholder tile.
+  static List<String> tokenizeSignLabels(
+    String gesture,
+    List<String> vocabulary,
+  ) {
+    final vocab = List.of(vocabulary)
+      ..sort((a, b) => b.length.compareTo(a.length));
+    final s = gesture.trim();
+    final wordChar = RegExp(r"[A-Za-z0-9']");
+    final out = <String>[];
+    var i = 0;
+    while (i < s.length) {
+      if (!wordChar.hasMatch(s[i])) {
+        i++;
+        continue;
+      }
+      final rest = s.substring(i).toLowerCase();
+      String? matched;
+      for (final label in vocab) {
+        final l = label.toLowerCase();
+        if (rest.startsWith(l) &&
+            (rest.length == l.length || !wordChar.hasMatch(rest[l.length]))) {
+          matched = label;
+          break;
+        }
+      }
+      if (matched != null) {
+        out.add(matched);
+        i += matched.length;
+      } else {
+        var j = i;
+        while (j < s.length && wordChar.hasMatch(s[j])) {
+          j++;
+        }
+        final token = s.substring(i, j);
+        if (token.toLowerCase() != 'unknown') out.add(token);
+        i = j;
+      }
+    }
+    return out;
   }
 
   /// Converts a streamed camera frame to a small JPEG (~448px wide).
@@ -976,6 +1060,7 @@ class TranslationController extends ChangeNotifier {
     sessionStartedAt = DateTime.now();
     liveTranscript = '';
     liveStatus = '';
+    liveSigns = const [];
     // Rolling live captions — translate the trailing ~5s every 3s and
     // merge into [liveTranscript] while the person keeps signing.
     _liveTicker?.cancel();
@@ -1025,6 +1110,9 @@ class TranslationController extends ChangeNotifier {
     _sessionTicker = null;
     _liveTicker?.cancel();
     _liveTicker = null;
+    // Live segments already spoken must not keep playing over the final
+    // result — clear the utterance queue on every stop path.
+    unawaited(tts.stopAll());
 
     final controller = cameraController;
     String? rawPath;
@@ -1118,6 +1206,7 @@ class TranslationController extends ChangeNotifier {
       result = await gemini.identifySigningSession(
         frames,
         vocabulary: _vocabulary,
+        preferAccuracy: true,
       );
       _cloudDownUntil = null;
       await _applyResult(
@@ -1468,10 +1557,14 @@ class TranslationController extends ChangeNotifier {
       if (history.length > 200) history.removeRange(200, history.length);
     }
 
+    // Recorded sessions already spoke each live segment — re-reading the
+    // whole transcript would duplicate the audio. When nothing was
+    // spoken live (e.g. all segments failed), the final still speaks.
     if (settings.autoSpeak &&
         gated.english.isNotEmpty &&
         gated.english != 'Could not determine' &&
-        (manual || changed)) {
+        (manual || changed) &&
+        (inputType != 'recording' || liveTranscript.isEmpty)) {
       await tts.speak(gated.english);
     }
     notifyListeners();
@@ -1512,6 +1605,7 @@ class TranslationController extends ChangeNotifier {
     _liveTicker?.cancel();
     _disposed = true;
     auth.removeListener(_onAuthChanged);
+    unawaited(tts.stopAll());
     unawaited(_releaseCamera());
     super.dispose();
   }

@@ -68,3 +68,6 @@ flutter_*.png
 
 # Android build reports
 /android/build/reports/
+
+# Supabase local CLI state
+supabase/.temp/

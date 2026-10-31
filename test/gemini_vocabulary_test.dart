@@ -44,6 +44,26 @@ void main() {
       expect(out.note, contains('dynamic sign'));
     });
 
+    test('substring hits no longer snap — palm/understand regression', () {
+      // 'flat palm facing chest' contains 'Palm' as a substring but the
+      // description isn't the sign; matching is token-level now.
+      final palm = GeminiService.snapToVocabulary(
+        r('flat palm facing chest'),
+        const ['Palm', 'Stand', 'Thank You'],
+      );
+      expect(palm.gesture, 'flat palm facing chest');
+      expect(palm.note, startsWith('Outside dataset:'));
+
+      // 'understand' contains 'stand' — raw substring matching used to
+      // hijack it to the 'Stand' label.
+      final understand = GeminiService.snapToVocabulary(
+        r('understand'),
+        const ['Palm', 'Stand', 'Thank You'],
+      );
+      expect(understand.gesture, 'understand');
+      expect(understand.note, startsWith('Outside dataset:'));
+    });
+
     test('unrecognised results pass through untouched', () {
       final unknown = GestureResult(
         gesture: 'Unknown',

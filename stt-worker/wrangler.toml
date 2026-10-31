@@ -1,0 +1,8 @@
+name = "thando-stt"
+main = "src/index.js"
+compatibility_date = "2025-06-01"
+
+# Workers AI binding — gives env.AI.run() access to the whisper models.
+# Free Cloudflare plan includes a daily Workers AI allocation.
+[ai]
+binding = "AI"

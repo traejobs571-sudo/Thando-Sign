@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:io';
 
+import 'package:flutter/foundation.dart' show listEquals;
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
@@ -10,7 +11,9 @@ import '../../models/translation_record.dart';
 import '../../route_observer.dart';
 import '../../services/auth_service.dart';
 import '../../services/connectivity_service.dart';
+import '../../models/sign_unit.dart';
 import '../../services/db_service.dart';
+import '../../services/duck_ai_service.dart';
 import '../../services/gemini_service.dart';
 import '../../services/gesture_image_service.dart';
 import '../../services/settings_service.dart';
@@ -45,6 +48,20 @@ class _TranslateScreenState extends State<TranslateScreen> with RouteAware {
   SignDescription? _signDescription;
   String? _speechError;
   Map<String, GestureItem> _gesturesByLabel = {};
+
+  /// Sequential highlight through the described signs — the "perform
+  /// the signs back" animation after a speech→sign translation lands.
+  int _activeSignIndex = -1;
+  Timer? _signPlayTimer;
+
+  /// User-corrected version of the heard phrase — speech recognition
+  /// mishears names and accents, so the Heard card is editable and
+  /// re-translatable. Cleared when fresh speech arrives.
+  String _editedHeard = '';
+
+  /// SignUnits from the multi-LLM gloss compiler — drives tiles and
+  /// non-manual-marker badges for the latest description.
+  List<SignUnit> _signUnits = [];
 
   // Cached in initState — provider lookups are unsafe once the widget is
   // deactivated, so dispose() must not call context.read.
@@ -100,13 +117,32 @@ class _TranslateScreenState extends State<TranslateScreen> with RouteAware {
   /// runs. Watch the service and kick off sign conversion the moment a
   /// finished phrase arrives.
   void _onSpeechTick() {
-    final text = _speechSvc.recognizedText;
+    final svc = _speechSvc;
+    final text = svc.recognizedText;
     if (text.isEmpty) {
       _describedText = '';
+      // A capture that ended with no text reports why — the cloud
+      // transcription resolves after stop() returns, so the mic-tap
+      // handler never sees this failure; without this the UI looked
+      // silently dead.
+      if (!svc.listening &&
+          !svc.transcribing &&
+          svc.lastError.isNotEmpty &&
+          _speechError == null) {
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (mounted && _speechError == null) {
+            setState(() => _speechError = svc.lastError);
+          }
+        });
+      }
       return;
     }
     if (!_speechMode || _describing || text == _describedText) return;
     _describedText = text;
+    // Fresh speech supersedes any manual edit and clears the stale
+    // "Nothing heard" error from an earlier failed attempt.
+    _editedHeard = '';
+    _speechError = null;
     _describeCurrentText(text);
   }
 
@@ -115,6 +151,7 @@ class _TranslateScreenState extends State<TranslateScreen> with RouteAware {
     routeObserver.unsubscribe(this);
     _speechSvc.removeListener(_onSpeechTick);
     _autoTimer?.cancel();
+    _signPlayTimer?.cancel();
     _controller.disposeCamera();
     super.dispose();
   }
@@ -167,20 +204,274 @@ class _TranslateScreenState extends State<TranslateScreen> with RouteAware {
     if (speech.listening) {
       await speech.stop();
       // _onSpeechTick picks up the final result and runs the conversion.
-      if (mounted && speech.recognizedText.isEmpty) {
+      if (mounted &&
+          speech.recognizedText.isEmpty &&
+          !speech.transcribing) {
         setState(() => _speechError = 'Nothing heard — try speaking again.');
       }
     } else {
+      _signPlayTimer?.cancel();
       setState(() {
         _signDescription = null;
         _speechError = null;
+        _activeSignIndex = -1;
+        _editedHeard = '';
+        _signUnits = [];
       });
       await speech.start();
     }
   }
 
+  /// Lets the user fix a misheard phrase and re-translate — on-device
+  /// speech recognition struggles with names and accents, so correcting
+  /// the text beats getting wrong signs.
+  Future<void> _editHeard(String current) async {
+    final ctrl = TextEditingController(text: current);
+    final edited = await showDialog<String>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Correct what was heard'),
+        content: TextField(
+          controller: ctrl,
+          autofocus: true,
+          maxLines: 3,
+          decoration: const InputDecoration(
+            hintText: 'Type the correct phrase…',
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(context, ctrl.text.trim()),
+            child: const Text('Translate'),
+          ),
+        ],
+      ),
+    );
+    if (edited == null || edited.isEmpty || edited == current || !mounted) {
+      return;
+    }
+    setState(() {
+      _editedHeard = edited;
+      _describedText = edited;
+      _speechError = null;
+    });
+    await _describeCurrentText(edited);
+  }
+
+  /// Loads gesture rows into [_gesturesByLabel] once — the speech→sign
+  /// tiles need them for illustrations; loaded on entering speech mode
+  /// so partial-speech tiles can render before describeSign returns.
+  Future<void> _loadGestureMap() async {
+    if (_gesturesByLabel.isNotEmpty || !mounted) return;
+    final gestures = await context.read<DbService>().getGestures(
+      activeOnly: false,
+    );
+    if (mounted) {
+      setState(() {
+        _gesturesByLabel = {
+          for (final g in gestures) g.label.toLowerCase(): g,
+        };
+      });
+    }
+  }
+
+  /// Flattens a description's SIGN entries into (label, gesture) tile
+  /// pairs — 'fingerspell:word' expands into one letter tile per char,
+  /// matching how [_buildSignCards] lays them out.
+  List<(String, GestureItem?, String)> _signTiles(SignDescription desc) {
+    final signs = desc.signs.isNotEmpty
+        ? desc.signs
+        : _deriveSignsFromPhrase(desc.phrase);
+    String norm(String s) =>
+        s.toLowerCase().replaceAll(RegExp('[^a-z0-9]+'), '');
+    String markerFor(String label) {
+      for (final u in _signUnits) {
+        final key = u.isFingerspelled ? u.originalWord : u.gloss;
+        if (norm(key) == norm(label)) return u.nonManualMarker;
+      }
+      return '';
+    }
+
+    final tiles = <(String, GestureItem?, String)>[];
+    for (final sign in signs) {
+      if (sign.toLowerCase().startsWith('fingerspell:')) {
+        // Every fingerspelled word becomes alphabet letter tiles —
+        // letter_x.png assets are bundled for all 26 letters, so any
+        // length renders. Long names used to fall through as one
+        // unmatched tile that could only draw the fallback palm.
+        for (final char in sign.substring(12).toLowerCase().split('')) {
+          if (!RegExp('[a-z]').hasMatch(char)) continue;
+          tiles.add((
+            char.toUpperCase(),
+            _gesturesByLabel['letter $char'],
+            '',
+          ));
+        }
+      } else {
+        tiles.add((sign, _resolveGesture(sign), markerFor(sign)));
+      }
+    }
+    return tiles;
+  }
+
+  /// Multi-source gloss chain — Gemini structured output first, then
+  /// duck_ai labels, then the local tokenizer. Each hop only runs when
+  /// the previous one failed, keeping cost and latency down; local
+  /// derivation guarantees every word is covered.
+  Future<({List<SignUnit> units, List<String> steps, String note})>
+  _compileSigns(String phrase, List<String> vocab) async {
+    // Capture service refs before any await (BuildContext lint).
+    final gemini = context.read<GeminiService>();
+    final duckAi = context.read<DuckAiService>();
+    ({List<SignUnit> units, List<String> steps, String note})? result;
+    try {
+      result = await gemini.compileSignGloss(phrase, vocab);
+    } catch (_) {}
+    if (result == null) {
+      // duck_ai hop now returns steps as well as sign labels — the
+      // fallback path keeps showing real instructions when Gemini is
+      // quota-blocked instead of a "needs the cloud" placeholder.
+      final duck = await duckAi.describeSigns(phrase, vocabulary: vocab);
+      if (duck != null && duck.signs.isNotEmpty) {
+        result = (
+          units: [for (final s in duck.signs) _unitFromLabel(s)],
+          steps: duck.steps,
+          note: duck.note,
+        );
+      }
+    }
+    result ??= (
+      units: [
+        for (final s in _deriveSignsFromPhrase(phrase)) _unitFromLabel(s),
+      ],
+      steps: const <String>[],
+      note: '',
+    );
+
+    // Coverage pass — append locally-derived words the AI gloss missed.
+    // A derived word counts as covered when EITHER the gloss or the
+    // spoken original word matches it, stems included — otherwise
+    // "going" mapped to gloss "Go" spawned a duplicate
+    // fingerspell:going tile at the end.
+    String norm(String s) =>
+        s.toLowerCase().replaceAll(RegExp('[^a-z0-9]+'), '');
+    String stemJoin(String s) => [
+          for (final t in _wordTokens(s)) _stemWord(t),
+        ].join();
+    bool covers(SignUnit u, String derived) {
+      final bare = derived.replaceAll('fingerspell:', '');
+      final dKeys = {norm(bare), stemJoin(bare)};
+      final uKeys = {
+        norm(u.gloss),
+        norm(u.originalWord),
+        stemJoin(u.gloss),
+        stemJoin(u.originalWord),
+      };
+      return dKeys.any(uKeys.contains);
+    }
+
+    final units = [...result.units];
+    for (final d in _deriveSignsFromPhrase(phrase)) {
+      if (!units.any((u) => covers(u, d))) {
+        units.add(_unitFromLabel(d));
+      }
+    }
+    return (units: units, steps: result.steps, note: result.note);
+  }
+
+  SignUnit _unitFromLabel(String label) {
+    if (label.toLowerCase().startsWith('fingerspell:')) {
+      final word = label.substring(12).trim();
+      return SignUnit(
+        gloss: word,
+        originalWord: word,
+        isFingerspelled: true,
+      );
+    }
+    return SignUnit(gloss: label, originalWord: label);
+  }
+
+  /// Word/short-phrase → dataset-gesture lookup for speech tiles.
+  /// Exact key first, then per-token stem and synonym expansion so
+  /// "walking" finds "Walk" and "thanks" finds "Thank You". Labels made
+  /// entirely of anatomical words (Palm, Hand) only ever match exactly —
+  /// a non-palm word must never resolve onto a "Palm" row.
+  GestureItem? _resolveGesture(String phrase) {
+    final exact = _gesturesByLabel[phrase.toLowerCase().trim()];
+    if (exact != null) return exact;
+    final tokens = _wordTokens(phrase);
+    if (tokens.isEmpty) return null;
+
+    // Alternatives per token position: the stem itself plus each
+    // synonym expansion, so "thanks" can try both [thank] and
+    // [thank, you]. Combos stay tiny — ≤3 tokens × a few synonyms.
+    final options = [
+      for (final t in tokens)
+        <List<String>>[
+          [_stemWord(t)],
+          for (final syn in _wordSynonyms[t] ?? const <String>[])
+            [for (final st in _wordTokens(syn)) _stemWord(st)],
+        ],
+    ];
+    var combos = <List<String>>[[]];
+    for (final opts in options) {
+      combos = [
+        for (final c in combos)
+          for (final o in opts) [...c, ...o],
+      ];
+      if (combos.length > 64) combos = combos.sublist(0, 64);
+    }
+
+    GestureItem? best;
+    for (final entry in _gesturesByLabel.entries) {
+      final lTokens = _wordTokens(entry.key);
+      if (lTokens.isEmpty) continue;
+      // Anatomy-only labels are exact-match territory (handled above).
+      if (lTokens.every(_anatomicalWords.contains)) continue;
+      final lStems = [for (final t in lTokens) _stemWord(t)];
+      for (final combo in combos) {
+        if (listEquals(combo, lStems)) {
+          if (best == null || entry.key.length > best.label.length) {
+            best = entry.value;
+          }
+          break;
+        }
+      }
+    }
+    return best;
+  }
+
+  /// Steps [_activeSignIndex] through every tile (~1.2s each) — the
+  /// sequential "performance" of the translated signs. Clears the
+  /// highlight when the sequence finishes.
+  void _startSignPlayback() {
+    _signPlayTimer?.cancel();
+    final desc = _signDescription;
+    if (desc == null) return;
+    final count = _signTiles(desc).length;
+    if (count == 0) return;
+    var i = 0;
+    setState(() => _activeSignIndex = 0);
+    _signPlayTimer = Timer.periodic(const Duration(milliseconds: 1200), (
+      timer,
+    ) {
+      i++;
+      if (i >= count) {
+        timer.cancel();
+        _signPlayTimer = null;
+        if (mounted) setState(() => _activeSignIndex = -1);
+        return;
+      }
+      if (mounted) setState(() => _activeSignIndex = i);
+    });
+  }
+
   Future<void> _describeCurrentText(String text) async {
-    final phrase = text.trim();
+    var phrase = text.trim();
     if (phrase.isEmpty) {
       setState(() => _speechError = 'Nothing heard — try speaking again.');
       return;
@@ -188,7 +479,16 @@ class _TranslateScreenState extends State<TranslateScreen> with RouteAware {
     setState(() => _describing = true);
     try {
       final db = context.read<DbService>();
-      final gemini = context.read<GeminiService>();
+      // Internet correction pass — catches names the on-device
+      // recogniser mishears (e.g. "Thando" → "Kendall"). The corrected
+      // phrase replaces what we translate and what the card shows.
+      final corrected = await context.read<DuckAiService>().correctHeard(
+        phrase,
+      );
+      if (corrected != null && mounted) {
+        phrase = corrected;
+        setState(() => _editedHeard = corrected);
+      }
       final gestures = await db.getGestures(activeOnly: false);
       // Load the vocabulary first so sign cards render even if the
       // cloud call below fails.
@@ -200,46 +500,83 @@ class _TranslateScreenState extends State<TranslateScreen> with RouteAware {
         });
       }
       if (!mounted) return;
-      final desc = await gemini.describeSign(
+      // Multi-source gloss chain — Gemini → duck_ai → local
+      // tokenizer, each only on the previous one's failure.
+      final compiled = await _compileSigns(
         phrase,
-        vocabulary: gestures.map((g) => g.label).toList(),
+        gestures.map((g) => g.label).toList(),
       );
-      if (mounted) setState(() => _signDescription = desc);
-      await _recordSpeechTranslation(phrase, desc);
+      _signUnits = compiled.units;
+      final mergedDesc = SignDescription(
+        phrase: phrase,
+        steps: compiled.steps,
+        note: compiled.note,
+        signs: [for (final u in compiled.units) u.tileLabel],
+      );
+      if (mounted) {
+        setState(() => _signDescription = mergedDesc);
+        _startSignPlayback();
+      }
+      await _recordSpeechTranslation(phrase, mergedDesc);
     } on GeminiQuotaException {
-      _fallbackSignCards(
-        phrase,
-        'Translation service is busy — wait a moment and retry.',
+      unawaited(
+        _fallbackSignCards(
+          phrase,
+          'Translation service is busy — wait a moment and retry.',
+        ),
       );
     } catch (e) {
-      _fallbackSignCards(
-        phrase,
-        e is StateError
-            ? e.message
-            : 'Could not translate — check your connection and retry.',
+      unawaited(
+        _fallbackSignCards(
+          phrase,
+          e is StateError
+              ? e.message
+              : 'Could not translate — check your connection and retry.',
+        ),
       );
     } finally {
-      if (mounted) setState(() => _describing = false);
+      if (mounted) {
+        setState(() => _describing = false);
+        // The cloud-verified transcript may have landed while this
+        // describe was running — the tick drops updates while busy, so
+        // translate the newest text here instead of leaving it stale.
+        final latest = _speechSvc.recognizedText;
+        if (latest.isNotEmpty && latest != _describedText) {
+          _describedText = latest;
+          unawaited(_describeCurrentText(latest));
+        }
+      }
     }
   }
 
-  /// When the cloud step-generation fails, still show per-word sign
-  /// cards derived from the local vocabulary — degraded but useful.
-  void _fallbackSignCards(String phrase, String message) {
+  /// When the primary describe throws, the same multi-source chain
+  /// still fills the cards — duck_ai/local usually cover the outage.
+  Future<void> _fallbackSignCards(String phrase, String message) async {
     if (!mounted) return;
-    final signs = _deriveSignsFromPhrase(phrase);
+    final compiled = await _compileSigns(
+      phrase,
+      _gesturesByLabel.values.map((g) => g.label).toList(),
+    );
+    if (!mounted) return;
+    _signUnits = compiled.units;
+    final signs = [for (final u in compiled.units) u.tileLabel];
     setState(() {
       _speechError = message;
       _signDescription = signs.isEmpty
           ? null
           : SignDescription(
               phrase: phrase,
-              steps: const [
-                'Detailed instructions need the cloud — the sign tiles above come from the local dataset.',
-              ],
+              steps: compiled.steps.isNotEmpty
+                  ? compiled.steps
+                  : const [
+                      'Detailed instructions need the cloud — the sign tiles above come from the local dataset.',
+                    ],
+              note: compiled.note,
               signs: signs,
             );
+      _activeSignIndex = -1;
     });
+    _startSignPlayback();
   }
 
   /// Speech translations land in history like sign translations do —
@@ -340,7 +677,10 @@ class _TranslateScreenState extends State<TranslateScreen> with RouteAware {
                   if (speech) {
                     _autoTimer?.cancel();
                     _controller.disposeCamera();
+                    unawaited(_loadGestureMap());
                   } else {
+                    _signPlayTimer?.cancel();
+                    _activeSignIndex = -1;
                     _resumeCamera();
                   }
                 },
@@ -804,7 +1144,8 @@ class _TranslateScreenState extends State<TranslateScreen> with RouteAware {
               // see their words appear in near real time.
               if (controller.recordingSession &&
                   (controller.liveTranscript.isNotEmpty ||
-                      controller.liveStatus.isNotEmpty))
+                      controller.liveStatus.isNotEmpty ||
+                      controller.liveSigns.isNotEmpty))
                 Positioned(
                   top: 44,
                   left: 12,
@@ -840,6 +1181,10 @@ class _TranslateScreenState extends State<TranslateScreen> with RouteAware {
                               fontSize: 11,
                             ),
                           ),
+                        if (controller.liveSigns.isNotEmpty) ...[
+                          const SizedBox(height: 8),
+                          _LiveSignStrip(signs: controller.liveSigns),
+                        ],
                       ],
                     ),
                   ),
@@ -1088,9 +1433,13 @@ class _TranslateScreenState extends State<TranslateScreen> with RouteAware {
   // ------------------------------------------------------------- speech mode
 
   Widget _buildSpeechMode(SpeechService speech, ConnectivityService conn) {
-    final heard = speech.recognizedText.isNotEmpty
-        ? speech.recognizedText
-        : speech.partialText;
+    // An edited phrase replaces the raw recognition for display — the
+    // service text itself can't be changed, so the override lives here.
+    final heard = _editedHeard.isNotEmpty
+        ? _editedHeard
+        : (speech.recognizedText.isNotEmpty
+              ? speech.recognizedText
+              : speech.partialText);
 
     return Column(
       children: [
@@ -1140,28 +1489,51 @@ class _TranslateScreenState extends State<TranslateScreen> with RouteAware {
         const SizedBox(height: 14),
         if (heard.isNotEmpty)
           GlassCard(
-            child: Column(
+            child: Row(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Text(
-                  'Heard',
-                  style: TextStyle(
-                    color: Colors.white.withValues(alpha: 0.55),
-                    fontSize: 12,
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        'Heard',
+                        style: TextStyle(
+                          color: Colors.white.withValues(alpha: 0.55),
+                          fontSize: 12,
+                        ),
+                      ),
+                      const SizedBox(height: 6),
+                      Text(
+                        heard,
+                        style: const TextStyle(
+                          fontSize: 20,
+                          fontWeight: FontWeight.w600,
+                          color: Colors.white,
+                        ),
+                      ),
+                    ],
                   ),
                 ),
-                const SizedBox(height: 6),
-                Text(
-                  heard,
-                  style: const TextStyle(
-                    fontSize: 20,
-                    fontWeight: FontWeight.w600,
-                    color: Colors.white,
+                IconButton(
+                  tooltip: 'Correct and re-translate',
+                  icon: const Icon(
+                    Icons.edit_outlined,
+                    color: AppColors.secondary,
+                    size: 20,
                   ),
+                  onPressed: _describing ? null : () => _editHeard(heard),
                 ),
               ],
             ),
           ),
+        // Live sign tiles from the partial phrase — rendered from the
+        // local vocabulary while the person is still speaking, so signs
+        // appear in real time before the cloud description lands.
+        if (_signDescription == null && heard.isNotEmpty) ...[
+          const SizedBox(height: 14),
+          _buildLiveSignTiles(heard),
+        ],
         if (_describing) ...[
           const SizedBox(height: 14),
           const Center(
@@ -1268,31 +1640,24 @@ class _TranslateScreenState extends State<TranslateScreen> with RouteAware {
     );
   }
 
-  /// One tile per sign the model mapped the phrase to — gesture
-  /// illustrations where they exist, letter tiles for fingerspelled
-  /// names/words. When the model omits SIGN lines, words are mapped to
-  /// the dataset vocabulary locally so the cards still render.
-  Widget _buildSignCards(SignDescription desc) {
-    final signs = desc.signs.isNotEmpty
-        ? desc.signs
-        : _deriveSignsFromPhrase(desc.phrase);
+  /// Offline sign tiles for the partial phrase while the person is
+  /// still speaking — real-time feedback before the cloud description
+  /// and its richer tiles arrive.
+  Widget _buildLiveSignTiles(String heard) {
+    final signs = _deriveSignsFromPhrase(heard);
     if (signs.isEmpty) return const SizedBox.shrink();
     final tiles = <Widget>[];
     for (final sign in signs) {
       if (sign.toLowerCase().startsWith('fingerspell:')) {
-        final word = sign.substring(12);
-        for (final char in word.toUpperCase().split('')) {
-          tiles.add(
-            _SignTile(
-              label: char,
-              gesture: _gesturesByLabel['letter ${char.toLowerCase()}'],
-            ),
-          );
+        // Alphabet tiles for every fingerspelled word — bundled letter
+        // art covers all 26 letters, so any length renders offline.
+        for (final char in sign.substring(12).toLowerCase().split('')) {
+          if (RegExp('[a-z]').hasMatch(char)) {
+            tiles.add(_LiveSignTile(label: char.toUpperCase()));
+          }
         }
       } else {
-        tiles.add(
-          _SignTile(label: sign, gesture: _gesturesByLabel[sign.toLowerCase()]),
-        );
+        tiles.add(_LiveSignTile(label: sign));
       }
     }
     return GlassCard(
@@ -1300,7 +1665,7 @@ class _TranslateScreenState extends State<TranslateScreen> with RouteAware {
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           Text(
-            'Signs',
+            'Signs so far',
             style: TextStyle(
               color: Colors.white.withValues(alpha: 0.55),
               fontSize: 12,
@@ -1313,9 +1678,58 @@ class _TranslateScreenState extends State<TranslateScreen> with RouteAware {
     );
   }
 
-  /// Offline-safe sign mapping: greedy longest-match of phrase words
-  /// against dataset labels; unmatched content words become
-  /// `fingerspell:word` entries.
+  /// One tile per sign the model mapped the phrase to — gesture
+  /// illustrations where they exist, letter tiles for fingerspelled
+  /// names/words. When the model omits SIGN lines, words are mapped to
+  /// the dataset vocabulary locally so the cards still render.
+  Widget _buildSignCards(SignDescription desc) {
+    final tiles = _signTiles(desc);
+    if (tiles.isEmpty) return const SizedBox.shrink();
+    return GlassCard(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Expanded(
+                child: Text(
+                  'Signs',
+                  style: TextStyle(
+                    color: Colors.white.withValues(alpha: 0.55),
+                    fontSize: 12,
+                  ),
+                ),
+              ),
+              IconButton(
+                tooltip: 'Replay signs',
+                icon: const Icon(
+                  Icons.replay,
+                  color: AppColors.secondary,
+                  size: 18,
+                ),
+                onPressed: _startSignPlayback,
+              ),
+            ],
+          ),
+          Wrap(spacing: 12, runSpacing: 12, children: [
+            for (var i = 0; i < tiles.length; i++)
+              _SignTile(
+                label: tiles[i].$1,
+                gesture: tiles[i].$2,
+                marker: tiles[i].$3,
+                active: _activeSignIndex == i,
+              ),
+          ]),
+        ],
+      ),
+    );
+  }
+
+  /// Offline-safe sign mapping: greedy longest n-gram match of phrase
+  /// words against the dataset via [_resolveGesture] — 5 tokens down to
+  /// 1 — so "what is your name" and "how are you" stay whole and
+  /// inflected words ("walking"→Walk, "thanks"→Thank You) still hit.
+  /// Unmatched content words become `fingerspell:word` entries.
   List<String> _deriveSignsFromPhrase(String phrase) {
     const filler = {
       'the',
@@ -1336,51 +1750,87 @@ class _TranslateScreenState extends State<TranslateScreen> with RouteAware {
       'me',
       'be',
     };
-    final tokens = phrase
-        .toLowerCase()
-        .split(RegExp(r"[^a-z0-9']+"))
-        .where((w) => w.isNotEmpty)
-        .toList();
+    final tokens = _wordTokens(phrase);
     final out = <String>[];
     var i = 0;
     while (i < tokens.length) {
-      if (i + 1 < tokens.length) {
-        final pair = '${tokens[i]} ${tokens[i + 1]}';
-        final g = _gesturesByLabel[pair];
+      var matched = false;
+      for (final n in [5, 4, 3, 2, 1]) {
+        if (i + n > tokens.length) continue;
+        final g = _resolveGesture(tokens.sublist(i, i + n).join(' '));
         if (g != null) {
           out.add(g.label);
-          i += 2;
-          continue;
+          i += n;
+          matched = true;
+          break;
         }
       }
-      final g = _gesturesByLabel[tokens[i]];
-      if (g != null) {
-        out.add(g.label);
-      } else if (!filler.contains(tokens[i])) {
-        out.add('fingerspell:${tokens[i]}');
+      if (!matched) {
+        if (!filler.contains(tokens[i])) {
+          out.add('fingerspell:${tokens[i]}');
+        }
+        i++;
       }
-      i++;
     }
     return out;
   }
 }
 
 /// A single sign tile — 64px illustration (resolved/generated on demand)
-/// with the gesture label underneath.
+/// with the gesture label underneath. [active] highlights the tile
+/// during the sequential playback animation.
 class _SignTile extends StatelessWidget {
-  const _SignTile({required this.label, this.gesture});
+  const _SignTile({
+    required this.label,
+    this.gesture,
+    this.active = false,
+    this.marker = '',
+  });
 
   final String label;
   final GestureItem? gesture;
+  final bool active;
+
+  /// Non-manual grammar marker from the gloss compiler —
+  /// eyebrows_raised / eyebrows_furrowed / head_shake / '' or 'neutral'.
+  final String marker;
 
   @override
   Widget build(BuildContext context) {
     return Column(
       mainAxisSize: MainAxisSize.min,
       children: [
-        ClipRRect(
-          borderRadius: BorderRadius.circular(12),
-          child: SizedBox(width: 64, height: 64, child: _image(context)),
+        AnimatedContainer(
+          duration: const Duration(milliseconds: 250),
+          decoration: BoxDecoration(
+            borderRadius: BorderRadius.circular(12),
+            border: Border.all(
+              color: active ? AppColors.accent : Colors.transparent,
+              width: 2,
+            ),
+            boxShadow: active
+                ? [
+                    BoxShadow(
+                      color: AppColors.accent.withValues(alpha: 0.45),
+                      blurRadius: 12,
+                    ),
+                  ]
+                : null,
+          ),
+          child: Stack(
+            children: [
+              ClipRRect(
+                borderRadius: BorderRadius.circular(10),
+                child: SizedBox(width: 64, height: 64, child: _image(context)),
+              ),
+              if (marker.isNotEmpty && marker != 'neutral')
+                Positioned(
+                  top: 2,
+                  right: 2,
+                  child: _MarkerBadge(marker: marker),
+                ),
+            ],
+          ),
         ),
         const SizedBox(height: 4),
         SizedBox(
@@ -1426,6 +1876,7 @@ class _SignTile extends StatelessWidget {
   Widget _fallback(BuildContext context, GestureItem? g, bool loading) {
     final asset =
         signAssetFor(g?.label ?? '') ??
+        signAssetFor(label) ??
         signAssetFor('letter ${label.toLowerCase()}');
     return Stack(
       fit: StackFit.expand,
@@ -1435,12 +1886,12 @@ class _SignTile extends StatelessWidget {
           child: asset != null
               ? Image.asset(asset, fit: BoxFit.contain)
               : g == null
-              ? _base()
+              ? _base(context)
               : FutureBuilder<List<double>?>(
                   future: context.read<DbService>().getSampleLandmarks(g.label),
                   builder: (_, s) => s.data != null
                       ? LandmarkHand(landmarks: s.data!)
-                      : _base(),
+                      : _base(context),
                 ),
         ),
         if (loading)
@@ -1460,25 +1911,331 @@ class _SignTile extends StatelessWidget {
     );
   }
 
-  Widget _base() {
-    final glyph = label.length == 1 ? null : signGlyphFor(label);
+  Widget _base(BuildContext context) {
+    if (label.length == 1) {
+      return Center(
+        child: Text(
+          label,
+          style: const TextStyle(
+            color: Colors.white,
+            fontSize: 28,
+            fontWeight: FontWeight.bold,
+          ),
+        ),
+      );
+    }
+    // AI-generated sign illustration first (consistent style, real
+    // gesture drawings), web image as fallback — never an emoji.
+    return FutureBuilder<File?>(
+      future: context.read<GestureImageService>().imageForWord(label),
+      builder: (context, snap) {
+        final f = snap.data;
+        if (f != null) {
+          return ClipRRect(
+            borderRadius: BorderRadius.circular(10),
+            child: Image.file(f, fit: BoxFit.cover),
+          );
+        }
+        if (snap.connectionState != ConnectionState.done) {
+          return _tileSpinner();
+        }
+        return FutureBuilder<String?>(
+          future: context.read<DuckAiService>().signImageUrl(label),
+          builder: (context, s) {
+            final url = s.data;
+            if (url != null) {
+              return ClipRRect(
+                borderRadius: BorderRadius.circular(10),
+                child: Image.network(
+                  url,
+                  fit: BoxFit.cover,
+                  errorBuilder: (_, _, _) => _signIcon(),
+                ),
+              );
+            }
+            if (s.connectionState != ConnectionState.done) {
+              return _tileSpinner();
+            }
+            return _signIcon();
+          },
+        );
+      },
+    );
+  }
+
+  Widget _tileSpinner() => const Center(
+    child: SizedBox(
+      width: 16,
+      height: 16,
+      child: CircularProgressIndicator(
+        strokeWidth: 2,
+        color: AppColors.secondary,
+      ),
+    ),
+  );
+
+  /// Last-resort tile visual — a text badge, never a hand icon: an
+  /// open-palm glyph lied about the sign for every unmatched word.
+  Widget _signIcon() {
+    final words = label
+        .trim()
+        .split(RegExp(r'\s+'))
+        .where((w) => w.isNotEmpty)
+        .toList();
+    if (words.isEmpty) {
+      return const Center(
+        child: Text(
+          '?',
+          style: TextStyle(
+            color: AppColors.secondary,
+            fontSize: 18,
+            fontWeight: FontWeight.bold,
+          ),
+        ),
+      );
+    }
+    final text = words.length > 1
+        ? words.take(2).map((w) => w[0]).join().toUpperCase()
+        : (words.first.length == 1
+              ? words.first.toUpperCase()
+              : words.first.substring(0, 2).toUpperCase());
     return Center(
-      child: label.length == 1
-          ? Text(
-              label,
-              style: const TextStyle(
-                color: Colors.white,
-                fontSize: 28,
-                fontWeight: FontWeight.bold,
+      child: Text(
+        text,
+        style: const TextStyle(
+          color: AppColors.secondary,
+          fontSize: 18,
+          fontWeight: FontWeight.bold,
+        ),
+      ),
+    );
+  }
+}
+
+/// Horizontal strip of sign tiles that grows as a session recognises
+/// signs — auto-scrolls to the newest entry so the latest sign is
+/// always in view without the user touching anything.
+class _LiveSignStrip extends StatefulWidget {
+  const _LiveSignStrip({required this.signs});
+
+  final List<String> signs;
+
+  @override
+  State<_LiveSignStrip> createState() => _LiveSignStripState();
+}
+
+class _LiveSignStripState extends State<_LiveSignStrip> {
+  final _scroll = ScrollController();
+
+  @override
+  void didUpdateWidget(_LiveSignStrip old) {
+    super.didUpdateWidget(old);
+    if (widget.signs.length != old.signs.length) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (_scroll.hasClients) {
+          _scroll.jumpTo(_scroll.position.maxScrollExtent);
+        }
+      });
+    }
+  }
+
+  @override
+  void dispose() {
+    _scroll.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return SizedBox(
+      height: 78,
+      child: ListView.separated(
+        controller: _scroll,
+        scrollDirection: Axis.horizontal,
+        itemCount: widget.signs.length,
+        separatorBuilder: (_, _) => const SizedBox(width: 8),
+        itemBuilder: (context, i) => _LiveSignTile(label: widget.signs[i]),
+      ),
+    );
+  }
+}
+
+/// Lightweight offline-only sign tile for live surfaces — bundled
+/// illustration, recorded landmark skeleton, glyph or letter. Never
+/// waits on the network/image-generation path so it can't stall a
+/// real-time strip.
+class _LiveSignTile extends StatelessWidget {
+  const _LiveSignTile({required this.label});
+
+  final String label;
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        ClipRRect(
+          borderRadius: BorderRadius.circular(10),
+          child: SizedBox(width: 52, height: 52, child: _image(context)),
+        ),
+        const SizedBox(height: 2),
+        SizedBox(
+          width: 60,
+          child: Text(
+            label,
+            textAlign: TextAlign.center,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: const TextStyle(color: Colors.white, fontSize: 9),
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _image(BuildContext context) {
+    final asset =
+        signAssetFor(label) ?? signAssetFor('letter ${label.toLowerCase()}');
+    if (asset != null) {
+      return Container(
+        color: AppColors.primary.withValues(alpha: 0.12),
+        child: Image.asset(asset, fit: BoxFit.contain),
+      );
+    }
+    return Container(
+      color: AppColors.primary.withValues(alpha: 0.12),
+      child: FutureBuilder<List<double>?>(
+        future: context.read<DbService>().getSampleLandmarks(label),
+        builder: (context, snap) {
+          if (snap.data != null) {
+            return LandmarkHand(landmarks: snap.data!);
+          }
+          if (label.length == 1) {
+            return Center(
+              child: Text(
+                label,
+                style: const TextStyle(
+                  color: Colors.white,
+                  fontSize: 22,
+                  fontWeight: FontWeight.bold,
+                ),
               ),
-            )
-          : (glyph != null
-                ? Text(glyph, style: const TextStyle(fontSize: 30))
-                : const Icon(
-                    Icons.back_hand_outlined,
-                    color: AppColors.secondary,
-                    size: 26,
-                  )),
+            );
+          }
+          // AI illustration first, web image fallback — never an emoji.
+          return FutureBuilder<File?>(
+            future: context.read<GestureImageService>().imageForWord(label),
+            builder: (context, gen) {
+              final f = gen.data;
+              if (f != null) {
+                return ClipRRect(
+                  borderRadius: BorderRadius.circular(10),
+                  child: Image.file(f, fit: BoxFit.cover),
+                );
+              }
+              if (gen.connectionState != ConnectionState.done) {
+                return _liveTileSpinner();
+              }
+              return FutureBuilder<String?>(
+                future: context.read<DuckAiService>().signImageUrl(label),
+                builder: (context, s) {
+                  final url = s.data;
+                  if (url != null) {
+                    return ClipRRect(
+                      borderRadius: BorderRadius.circular(10),
+                      child: Image.network(
+                        url,
+                        fit: BoxFit.cover,
+                        errorBuilder: (_, _, _) => _liveSignIcon(),
+                      ),
+                    );
+                  }
+                  if (s.connectionState != ConnectionState.done) {
+                    return _liveTileSpinner();
+                  }
+                  return _liveSignIcon();
+                },
+              );
+            },
+          );
+        },
+      ),
+    );
+  }
+
+  Widget _liveTileSpinner() => const Center(
+    child: SizedBox(
+      width: 14,
+      height: 14,
+      child: CircularProgressIndicator(
+        strokeWidth: 2,
+        color: AppColors.secondary,
+      ),
+    ),
+  );
+
+  /// Text-badge fallback — an open-palm icon implied a sign that isn't
+  /// actually one, so unmatched words show their initials instead.
+  Widget _liveSignIcon() {
+    final words = label
+        .trim()
+        .split(RegExp(r'\s+'))
+        .where((w) => w.isNotEmpty)
+        .toList();
+    if (words.isEmpty) {
+      return const Center(
+        child: Text(
+          '?',
+          style: TextStyle(
+            color: AppColors.secondary,
+            fontSize: 14,
+            fontWeight: FontWeight.bold,
+          ),
+        ),
+      );
+    }
+    final text = words.length > 1
+        ? words.take(2).map((w) => w[0]).join().toUpperCase()
+        : (words.first.length == 1
+              ? words.first.toUpperCase()
+              : words.first.substring(0, 2).toUpperCase());
+    return Center(
+      child: Text(
+        text,
+        style: const TextStyle(
+          color: AppColors.secondary,
+          fontSize: 14,
+          fontWeight: FontWeight.bold,
+        ),
+      ),
+    );
+  }
+}
+
+/// Small badge marking non-manual grammar on a sign tile —
+/// eyebrows_raised → yes/no question, eyebrows_furrowed → wh-question,
+/// head_shake → negation. Icons only, never emoji.
+class _MarkerBadge extends StatelessWidget {
+  const _MarkerBadge({required this.marker});
+
+  final String marker;
+
+  @override
+  Widget build(BuildContext context) {
+    final icon = switch (marker) {
+      'eyebrows_raised' => Icons.help_outline,
+      'eyebrows_furrowed' => Icons.help,
+      'head_shake' => Icons.block,
+      _ => null,
+    };
+    if (icon == null) return const SizedBox.shrink();
+    return Container(
+      padding: const EdgeInsets.all(2),
+      decoration: const BoxDecoration(
+        color: AppColors.accent,
+        shape: BoxShape.circle,
+      ),
+      child: Icon(icon, size: 12, color: Colors.black),
     );
   }
 }
@@ -1688,3 +2445,110 @@ class _CaptureButton extends StatelessWidget {
     );
   }
 }
+
+// ---------------------------------------------------------------------
+// Speech→sign word matching — file-private helpers.
+// Keep _stemWord/_wordTokens identical to the copies in
+// gemini_service.dart: the two sides implement the same conservative
+// stemming contract by design.
+// ---------------------------------------------------------------------
+
+/// Lowercase word tokens for sign matching.
+List<String> _wordTokens(String s) => s
+    .toLowerCase()
+    .split(RegExp("[^a-z0-9']+"))
+    .where((w) => w.isNotEmpty)
+    .toList();
+
+/// Conservative English stem for transcript words — strips only the
+/// inflections speech actually produces. A missed stem just costs a
+/// fingerspell tile; a wrong stem could hijack a real sign.
+String _stemWord(String w) {
+  if (w.length <= 3) return w;
+  if (w.endsWith('ies')) return '${w.substring(0, w.length - 3)}y';
+  if (w.endsWith('ing')) return _undouble(w.substring(0, w.length - 3));
+  if (w.endsWith('ed')) return _undouble(w.substring(0, w.length - 2));
+  if (w.endsWith('es') &&
+      !w.endsWith('ses') &&
+      w.substring(0, w.length - 2).length >= 2) {
+    return w.substring(0, w.length - 2);
+  }
+  if (w.endsWith('s') &&
+      !w.endsWith('ss') &&
+      !w.endsWith('us') &&
+      w.length > 4) {
+    return w.substring(0, w.length - 1);
+  }
+  return w;
+}
+
+/// Drops a doubled final consonant left by -ing/-ed stripping:
+/// running→runn→run, stopped→stopp→stop.
+String _undouble(String s) {
+  if (s.length > 2 && s[s.length - 1] == s[s.length - 2]) {
+    return s.substring(0, s.length - 1);
+  }
+  return s;
+}
+
+/// Body-part vocabulary — labels made entirely of these only match
+/// exactly; they never resolve loosely from other words.
+const _anatomicalWords = {
+  'palm',
+  'palms',
+  'hand',
+  'hands',
+  'finger',
+  'fingers',
+  'wrist',
+  'arm',
+  'arms',
+  'fist',
+};
+
+/// Small spoken-English synonym expansions for vocabulary lookup —
+/// keyed on the spoken token, values are the dataset phrasing. Kept
+/// deliberately short: every entry trades a fingerspell tile for the
+/// risk of a wrong sign.
+const _wordSynonyms = <String, List<String>>{
+  'thanks': ['thank you'],
+  'hi': ['hello'],
+  'hey': ['hello'],
+  'bye': ['goodbye'],
+  'ok': ['okay'],
+  'yeah': ['yes'],
+  'yep': ['yes'],
+  'nope': ['no'],
+  'nah': ['no'],
+  'mum': ['mother'],
+  'mom': ['mother'],
+  'mommy': ['mother'],
+  'mama': ['mother'],
+  'dad': ['father'],
+  'daddy': ['father'],
+  'papa': ['father'],
+  'kid': ['child'],
+  'kids': ['child'],
+  'granny': ['grandmother'],
+  'grandma': ['grandmother'],
+  'grandpa': ['grandfather'],
+  'hubby': ['husband'],
+  'wifey': ['wife'],
+  'buddy': ['friend'],
+  'pal': ['friend'],
+  'bathroom': ['toilet'],
+  'restroom': ['toilet'],
+  'loo': ['toilet'],
+  'ill': ['sick'],
+  'unwell': ['sick'],
+  'doc': ['doctor'],
+  'taxi': ['kombi'],
+  'minibus': ['kombi'],
+  'shop': ['market'],
+  'store': ['market'],
+  'sob': ['cry'],
+  'scared': ['afraid'],
+  'frightened': ['afraid'],
+  'mad': ['angry'],
+  'stroll': ['walk'],
+};

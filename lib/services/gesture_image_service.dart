@@ -9,6 +9,7 @@ import 'package:path_provider/path_provider.dart';
 import '../models/gesture_item.dart';
 import 'auth_service.dart';
 import 'db_service.dart';
+import 'duck_ai_service.dart';
 import 'gemini_service.dart';
 import 'supabase_service.dart';
 
@@ -27,12 +28,14 @@ class GestureImageService {
     required this.supabase,
     required this.gemini,
     required this.auth,
+    this.duckAi,
   });
 
   final DbService db;
   final SupabaseService supabase;
   final GeminiService gemini;
   final AuthService auth;
+  final DuckAiService? duckAi;
 
   // One resolution per gesture at a time — dedupes simultaneous UI
   // requests and serialises quota spend during bulk generation.
@@ -68,6 +71,38 @@ class GestureImageService {
     final dir = await getApplicationDocumentsDirectory();
     final file = File(p.join(dir.path, 'gesture_images', '$uuid.jpg'));
     return file.existsSync() ? file : null;
+  }
+
+  /// AI illustration for a word that isn't in the gesture dataset —
+  /// names, places and other proper nouns, so tiles show a real image
+  /// instead of letter walls or emoji. Disk-cached per word and
+  /// deduped in flight via [_wordCache] and the generation queue.
+  final Map<String, Future<File?>> _wordCache = {};
+
+  Future<File?> imageForWord(String label) => _wordCache.putIfAbsent(
+    label.toLowerCase(),
+    () => _wordImage(label),
+  );
+
+  Future<File?> _wordImage(String label) async {
+    try {
+      final dir = Directory(
+        p.join(
+          (await getApplicationDocumentsDirectory()).path,
+          'gesture_images_words',
+        ),
+      );
+      await dir.create(recursive: true);
+      final safe = label.toLowerCase().replaceAll(RegExp('[^a-z0-9]+'), '_');
+      final file = File(p.join(dir.path, '$safe.jpg'));
+      if (await file.exists()) return file;
+      final raw = await _generateSerialized(label, 'sign for "$label"');
+      if (raw == null) return null;
+      await file.writeAsBytes(_compress(raw));
+      return file;
+    } catch (_) {
+      return null;
+    }
   }
 
   /// Attaches an image picked on-device (photo / downloaded illustration)
@@ -122,7 +157,25 @@ class GestureImageService {
 
     // Generate — the AI facilitation path. Serialized so a burst of
     // misses can't hammer the API quota.
-    final raw = await _generateSerialized(g.label, g.meaning);
+    var raw = await _generateSerialized(g.label, g.meaning);
+    if (raw == null && duckAi != null) {
+      // Web-image fallback — a real sign illustration beats an emoji
+      // placeholder when generation is quota-blocked.
+      final url = await duckAi!.searchSignImage(g.label);
+      if (url != null) {
+        try {
+          final client = HttpClient();
+          try {
+            final res = await (await client.getUrl(Uri.parse(url))).close();
+            if (res.statusCode == 200) {
+              raw = await consolidateHttpClientResponseBytes(res);
+            }
+          } finally {
+            client.close();
+          }
+        } catch (_) {}
+      }
+    }
     if (raw == null) return null;
     final bytes = _compress(raw);
     await file.parent.create(recursive: true);

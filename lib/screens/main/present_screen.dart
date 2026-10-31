@@ -3,6 +3,7 @@ import 'package:provider/provider.dart';
 
 import '../../controllers/translation_controller.dart';
 import '../../services/connectivity_service.dart';
+import '../../services/duck_ai_service.dart';
 import '../../services/gemini_service.dart';
 import '../../theme/app_theme.dart';
 import '../../widgets/glass_card.dart';
@@ -37,10 +38,24 @@ class _PresentScreenState extends State<PresentScreen> {
       _loadingSteps = true;
       _stepsError = null;
     });
+    // Capture service refs before any await (BuildContext lint).
+    final gemini = context.read<GeminiService>();
+    final duckAi = context.read<DuckAiService>();
     try {
-      final desc = await context.read<GeminiService>().describeSign(
-        result.gesture,
-      );
+      SignDescription desc;
+      try {
+        desc = await gemini.describeSign(result.gesture);
+      } catch (_) {
+        // Gemini down/quota — duck_ai keeps the steps useful.
+        final duck = await duckAi.describeSigns(result.gesture);
+        if (duck == null) rethrow;
+        desc = SignDescription(
+          phrase: result.gesture,
+          steps: duck.steps,
+          note: duck.note,
+          signs: duck.signs,
+        );
+      }
       _stepsCache[result.gesture] = desc;
       if (mounted) setState(() => _showSteps = true);
     } on GeminiQuotaException {

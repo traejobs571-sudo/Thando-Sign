@@ -8,6 +8,8 @@ import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:google_generative_ai/google_generative_ai.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import '../models/sign_unit.dart';
+
 class GestureResult {
   final String gesture;
   final String english;
@@ -68,6 +70,16 @@ class GeminiService {
     'gemini-3.5-flash',
     'gemini-2.5-flash',
     'gemini-2.5-flash-lite',
+  ];
+
+  /// Accuracy-first list for the FINAL transcript of a session — the
+  /// pro-tier models are slower and costlier, so live-segment ticks keep
+  /// [_modelNames]. Unknown names fall through the same unavailable/
+  /// not-found handling, so entries here are safe even if unavailable.
+  static const _accurateModelNames = [
+    'gemini-3-pro',
+    'gemini-2.5-pro',
+    ..._modelNames,
   ];
 
   /// The model that answered most recently — tried first on the next
@@ -201,6 +213,7 @@ Rules you must follow:
   Future<GenerateContentResponse> _generateWithFallback(
     List<Content> content, {
     int maxOutputTokens = 256,
+    List<String>? modelNames,
   }) async {
     final apiKey = await getApiKey();
     if (apiKey == null || apiKey.isEmpty) {
@@ -209,7 +222,12 @@ Rules you must follow:
       );
     }
     try {
-      return await _generate(apiKey, content, maxOutputTokens: maxOutputTokens);
+      return await _generate(
+        apiKey,
+        content,
+        maxOutputTokens: maxOutputTokens,
+        modelNames: modelNames,
+      );
     } on GenerativeAIException catch (e) {
       if (!_isAuthError(e.message)) rethrow;
       debugPrint('Gemini rejected the API key: ${e.message}');
@@ -229,6 +247,7 @@ Rules you must follow:
             fallback,
             content,
             maxOutputTokens: maxOutputTokens,
+            modelNames: modelNames,
           );
         } on GenerativeAIException catch (e2) {
           debugPrint('Fallback key also rejected: ${e2.message}');
@@ -252,12 +271,13 @@ ${vocabulary.map((v) => '- $v').join('\n')}
 You MUST answer with the closest matching label from this vocabulary whenever one reasonably fits — copy the label EXACTLY as written. Only when NO label reasonably fits, return a short freeform description instead.
 ''';
 
-  /// Snaps a cloud result to the dataset: exact (case-insensitive) label
-  /// → normalised casing; a label contained in the answer or vice versa
-  /// → snapped to the longest match; otherwise kept as freeform and
-  /// flagged "Outside dataset:" so the UI can show it wasn't a
-  /// ZSL-catalogued match. Post-validation for the hybrid strict/prefer
-  /// contract in [_vocabSection].
+  /// Snaps a cloud result to the dataset via [matchVocabularyLabel]:
+  /// token-level matching, never raw substring — "understand" must not
+  /// snap to "Stand" and "flat palm facing chest" must not snap to
+  /// "Palm". Unmatched answers stay freeform flagged "Outside dataset:"
+  /// so the UI can show it wasn't a ZSL-catalogued match.
+  /// Post-validation for the hybrid strict/prefer contract in
+  /// [_vocabSection].
   static GestureResult snapToVocabulary(
     GestureResult result,
     List<String> vocabulary,
@@ -265,22 +285,7 @@ You MUST answer with the closest matching label from this vocabulary whenever on
     if (vocabulary.isEmpty || result.english == 'Could not determine') {
       return result;
     }
-    final want = result.gesture.trim().toLowerCase();
-    String? exact;
-    String? contained;
-    for (final label in vocabulary) {
-      final l = label.toLowerCase();
-      if (l == want) {
-        exact = label;
-        break;
-      }
-      if (want.contains(l) || l.contains(want)) {
-        if (contained == null || label.length > contained.length) {
-          contained = label;
-        }
-      }
-    }
-    final snapped = exact ?? contained;
+    final snapped = matchVocabularyLabel(result.gesture, vocabulary);
     if (snapped != null) {
       return GestureResult(
         gesture: snapped,
@@ -296,6 +301,221 @@ You MUST answer with the closest matching label from this vocabulary whenever on
       note: 'Outside dataset:${result.note.isEmpty ? '' : ' ${result.note}'}',
     );
   }
+
+  /// Matches [query] against [vocabulary] and returns the exact dataset
+  /// label, or null. The ladder: (a) normalised whole-string equality;
+  /// (b) the label appearing as a consecutive whole-token sequence in
+  /// the query (stems applied per token); (c) every query token inside
+  /// the label's token set — allowed only when the query carries real
+  /// content words, so "i love" snaps to "I Love You" while a bare "i"
+  /// can't. A label made purely of anatomical words (Palm, Hand) only
+  /// ever matches exactly — descriptions like "flat palm facing chest"
+  /// stay freeform.
+  static String? matchVocabularyLabel(
+    String query,
+    List<String> vocabulary,
+  ) {
+    if (vocabulary.isEmpty) return null;
+    final qNorm = query.toLowerCase().replaceAll(RegExp('[^a-z0-9]+'), '');
+    if (qNorm.isEmpty) return null;
+    for (final label in vocabulary) {
+      if (label.toLowerCase().replaceAll(RegExp('[^a-z0-9]+'), '') ==
+          qNorm) {
+        return label;
+      }
+    }
+
+    final qTokens = _signTokens(query);
+    final qHasContent = qTokens.any(
+      (t) => !_signAnatomical.contains(t) && !_signFunctionWords.contains(t),
+    );
+    // Synonym-expanded stem variants — "thanks" tries both [thank] and
+    // [thank, you]. The unexpanded sequence is always the first combo.
+    final qVariants = _signStemVariants(qTokens);
+
+    String? best;
+    for (final label in vocabulary) {
+      final lTokens = _signTokens(label);
+      if (lTokens.isEmpty) continue;
+      final pureAnatomical = lTokens.every(_signAnatomical.contains);
+      if (pureAnatomical) continue; // exact match already checked above
+      final lStems = [for (final t in lTokens) _signStem(t)];
+      final labelSet = lStems.toSet();
+
+      var matched = false;
+      for (final stems in qVariants) {
+        if (lStems.length <= stems.length) {
+          for (
+            var i = 0;
+            i + lStems.length <= stems.length && !matched;
+            i++
+          ) {
+            matched = true;
+            for (var j = 0; j < lStems.length; j++) {
+              if (stems[i + j] != lStems[j]) {
+                matched = false;
+                break;
+              }
+            }
+          }
+        }
+        if (!matched && qHasContent && stems.length > 1) {
+          matched = stems.every(labelSet.contains);
+        }
+        if (matched) break;
+      }
+      if (matched && (best == null || label.length > best.length)) {
+        best = label;
+      }
+    }
+    return best;
+  }
+
+  /// Stem sequences for the query with each token independently
+  /// expandable through [_signSynonyms] — "thanks" yields [thank] and
+  /// [thank, you]. Capped so odd inputs can't explode combinatorially.
+  static List<List<String>> _signStemVariants(List<String> tokens) {
+    var combos = <List<String>>[[]];
+    for (final t in tokens) {
+      final options = <List<String>>[
+        [_signStem(t)],
+        for (final syn in _signSynonyms[t] ?? const <String>[])
+          [for (final st in _signTokens(syn)) _signStem(st)],
+      ];
+      combos = [
+        for (final c in combos)
+          for (final o in options) [...c, ...o],
+      ];
+      if (combos.length > 64) return combos.sublist(0, 64);
+    }
+    return combos;
+  }
+
+  /// Lowercase word tokens for sign matching.
+  static List<String> _signTokens(String s) => s
+      .toLowerCase()
+      .split(RegExp("[^a-z0-9']+"))
+      .where((w) => w.isNotEmpty)
+      .toList();
+
+  /// Conservative English stem for transcript words — strips only the
+  /// inflections speech actually produces. A missed stem just costs a
+  /// fingerspell tile; a wrong stem could hijack a real sign.
+  static String _signStem(String w) {
+    if (w.length <= 3) return w;
+    if (w.endsWith('ies')) return '${w.substring(0, w.length - 3)}y';
+    if (w.endsWith('ing')) return _undouble(w.substring(0, w.length - 3));
+    if (w.endsWith('ed')) return _undouble(w.substring(0, w.length - 2));
+    if (w.endsWith('es') &&
+        !w.endsWith('ses') &&
+        w.substring(0, w.length - 2).length >= 2) {
+      return w.substring(0, w.length - 2);
+    }
+    if (w.endsWith('s') &&
+        !w.endsWith('ss') &&
+        !w.endsWith('us') &&
+        w.length > 4) {
+      return w.substring(0, w.length - 1);
+    }
+    return w;
+  }
+
+  /// Drops a doubled final consonant left by -ing/-ed stripping:
+  /// running→runn→run, stopped→stopp→stop.
+  static String _undouble(String s) {
+    if (s.length > 2 && s[s.length - 1] == s[s.length - 2]) {
+      return s.substring(0, s.length - 1);
+    }
+    return s;
+  }
+
+  /// Body-part vocabulary — never counts as match evidence, since
+  /// gesture descriptions mention hands constantly.
+  static const _signAnatomical = {
+    'palm',
+    'palms',
+    'hand',
+    'hands',
+    'finger',
+    'fingers',
+    'wrist',
+    'arm',
+    'arms',
+    'fist',
+  };
+
+  /// Function words — a query can't match INTO a longer label on these
+  /// alone ("i" must never snap to "I Am Fine").
+  static const _signFunctionWords = {
+    'i',
+    'a',
+    'an',
+    'the',
+    'is',
+    'am',
+    'are',
+    'was',
+    'my',
+    'me',
+    'you',
+    'your',
+    'to',
+    'of',
+    'in',
+    'on',
+    'at',
+    'it',
+    'be',
+    'do',
+    'for',
+    'and',
+  };
+
+  /// Spoken-English synonym expansions — keep in sync with the copy in
+  /// translate_screen.dart; both sides share the same conservative
+  /// stemming/synonym contract by design.
+  static const _signSynonyms = <String, List<String>>{
+    'thanks': ['thank you'],
+    'hi': ['hello'],
+    'hey': ['hello'],
+    'bye': ['goodbye'],
+    'ok': ['okay'],
+    'yeah': ['yes'],
+    'yep': ['yes'],
+    'nope': ['no'],
+    'nah': ['no'],
+    'mum': ['mother'],
+    'mom': ['mother'],
+    'mommy': ['mother'],
+    'mama': ['mother'],
+    'dad': ['father'],
+    'daddy': ['father'],
+    'papa': ['father'],
+    'kid': ['child'],
+    'kids': ['child'],
+    'granny': ['grandmother'],
+    'grandma': ['grandmother'],
+    'grandpa': ['grandfather'],
+    'hubby': ['husband'],
+    'wifey': ['wife'],
+    'buddy': ['friend'],
+    'pal': ['friend'],
+    'bathroom': ['toilet'],
+    'restroom': ['toilet'],
+    'loo': ['toilet'],
+    'ill': ['sick'],
+    'unwell': ['sick'],
+    'doc': ['doctor'],
+    'taxi': ['kombi'],
+    'minibus': ['kombi'],
+    'shop': ['market'],
+    'store': ['market'],
+    'sob': ['cry'],
+    'scared': ['afraid'],
+    'frightened': ['afraid'],
+    'mad': ['angry'],
+    'stroll': ['walk'],
+  };
 
   /// Recognise a ZSL gesture from a camera frame. Passing [vocabulary]
   /// constrains Gemini to known labels, which keeps results consistent.
@@ -469,11 +689,14 @@ NOTE: <why it was unclear>
   /// [identifyDynamicSign] (one sign mid-movement), these frames span a
   /// continuous message from a single signer — the model must segment
   /// the signing itself and return everything that was communicated.
-  /// Longer transcripts need the bigger output budget.
+  /// Longer transcripts need the bigger output budget. [preferAccuracy]
+  /// is for the end-of-session call — live-segment ticks keep the fast
+  /// default models.
   Future<GestureResult> identifySigningSession(
     List<Uint8List> frames, {
     String mimeType = 'image/jpeg',
     List<String> vocabulary = const [],
+    bool preferAccuracy = false,
   }) async {
     final vocabSection = _vocabSection(vocabulary);
 
@@ -504,6 +727,7 @@ NOTE: <why it was unclear>
           ]),
         ],
         maxOutputTokens: 1024,
+        modelNames: preferAccuracy ? _accurateModelNames : null,
       );
       final text = response.text?.trim() ?? '';
       debugPrint('Session response: $text');
@@ -522,6 +746,71 @@ NOTE: <why it was unclear>
   /// Describe how to sign a phrase in ZSL — used for speech → sign output.
   /// [vocabulary] constrains the SIGN lines to real dataset labels so the
   /// UI can resolve each sign to a stored gesture + illustration.
+  /// Structured sign-gloss compilation — the first hop in the
+  /// multi-source chain (duck_ai and local derivation follow on
+  /// failure). Returns
+  /// SignUnits + instruction steps; throws so callers can fall through.
+  Future<({List<SignUnit> units, List<String> steps, String note})>
+  compileSignGloss(String phrase, List<String> vocabulary) async {
+    final vocab = vocabulary.isEmpty
+        ? ''
+        : '\nKnown sign vocabulary: ${vocabulary.join(', ')}\n'
+              'You MUST use a label from this vocabulary whenever one '
+              'reasonably fits — copy it EXACTLY as written for the '
+              'gloss. Only invent a gloss when NO label reasonably fits.';
+    final response = await _generateWithFallback([
+      Content.text(
+        'You are an expert Zimbabwe Sign Language (ZSL) translator. '
+        'Convert this English phrase to sign gloss order — drop filler '
+        'words, use Time→Topic→Comment order, mark proper names and '
+        'words with no standard sign as is_fingerspelled, and tag '
+        'question or negation grammar in non_manual_marker '
+        '(eyebrows_raised for yes/no questions, eyebrows_furrowed for '
+        'wh-questions, head_shake for negation, else neutral). Give each '
+        'sign a short physical handshape_hint (e.g. "flat hand", "fist", '
+        '"index pointing", "ILY handshape").\n\n'
+        'Phrase: "$phrase"$vocab\n\n'
+        'Reply with ONLY JSON, no markdown: {"signs":[{"gloss":"HELLO",'
+        '"original_word":"hello","is_fingerspelled":false,'
+        '"non_manual_marker":"neutral","handshape_hint":"open hand"}],'
+        '"steps":["step"],"note":""}',
+      ),
+    ]);
+    final text = (response.text ?? '')
+        .replaceAll(RegExp(r'```(?:json)?'), '')
+        .trim();
+    final parsed = jsonDecode(text);
+    if (parsed is! Map) throw StateError('bad gloss response');
+    final units = <SignUnit>[
+      for (final s in parsed['signs'] as List? ?? const [])
+        if (s is Map<String, dynamic>) SignUnit.fromJson(s),
+    ];
+    if (units.isEmpty) throw StateError('empty gloss response');
+    // Snap loose model glosses onto the exact dataset labels — the tile
+    // layer keys its image chain on the label, so a near-miss like
+    // "Walked" must come back as "Walk".
+    final validated = vocabulary.isEmpty
+        ? units
+        : [
+            for (final u in units)
+              if (u.isFingerspelled)
+                u
+              else
+                u.copyWith(
+                  gloss:
+                      matchVocabularyLabel(u.gloss, vocabulary) ?? u.gloss,
+                ),
+          ];
+    return (
+      units: validated,
+      steps: <String>[
+        for (final s in parsed['steps'] as List? ?? const [])
+          if (s is String) s,
+      ],
+      note: parsed['note'] as String? ?? '',
+    );
+  }
+
   Future<SignDescription> describeSign(
     String phrase, {
     List<String> vocabulary = const [],
@@ -572,17 +861,23 @@ Rules:
   /// Tries each model in [_modelNames]; moves to the next when a model has
   /// been retired or is not found on the API. The last model that worked
   /// goes first — steady-state calls are a single request, not a serial
-  /// probe of the whole list.
+  /// probe of the whole list. Passing [modelNames] overrides the order
+  /// entirely (accuracy-first calls don't get short-circuited by the
+  /// cached fast model).
   Future<GenerateContentResponse> _generate(
     String apiKey,
     List<Content> content, {
     int maxOutputTokens = 256,
+    List<String>? modelNames,
   }) async {
     var sawQuota = false;
-    final ordered = <String>[
-      ?_workingModel,
-      ..._modelNames.where((m) => m != _workingModel),
-    ];
+    final names = modelNames ?? _modelNames;
+    final ordered = modelNames == null
+        ? <String>[
+            ?_workingModel,
+            ...names.where((m) => m != _workingModel),
+          ]
+        : List.of(names);
     for (final name in ordered) {
       try {
         final res = await _model(
@@ -650,13 +945,17 @@ Rules:
     if (DateTime.now().isBefore(_imageBlockedUntil)) return null;
     var apiKey = await getApiKey();
     if (apiKey == null || apiKey.isEmpty) return null;
+    final cue = _physicalSignCue(label);
     final prompt =
         'Flat vector-style instructional illustration, upper body of a '
         'friendly cartoon person performing the Zimbabwe Sign Language '
         'sign for "$label"${meaning.isNotEmpty ? ' ($meaning)' : ''} on a '
         'plain white background. Clean simple outlines, soft flat colors, '
-        'both hands clearly visible with distinct finger positions, a '
-        'curved arrow showing hand movement direction if the sign moves, '
+        'both hands clearly visible with distinct finger positions'
+        '${cue.isNotEmpty ? ' — the sign uses $cue' : ''}. '
+        'Show that specific handshape; do NOT draw a generic flat open '
+        'palm unless that is literally the sign. '
+        'A curved arrow shows hand movement direction if the sign moves, '
         'the word "$label" in bold capital letters underneath. No '
         'photorealism, no extra objects.';
 
@@ -672,6 +971,135 @@ Rules:
     }
     return null;
   }
+
+  /// Physical handshape cue for image prompts. Without a concrete shape
+  /// the image models default to a cartoon person holding up a flat
+  /// palm for every sign, so known labels carry their real shape here.
+  /// Fingerspelling letters get a generic letter instruction — the 26
+  /// alphabet images are bundled assets anyway.
+  static String _physicalSignCue(String label) {
+    final l = label.toLowerCase();
+    if (l.startsWith('letter ') && l.length == 8) {
+      return 'the manual-alphabet fingerspelling handshape for the '
+          'letter ${l.substring(7).toUpperCase()}';
+    }
+    return _signCues[l] ?? '';
+  }
+
+  static const _signCues = <String, String>{
+    'hello': 'an open hand beside the forehead waving side to side',
+    'goodbye': 'an open hand waving side to side',
+    'thank you': 'flat fingers touching the chin, then moving forward',
+    'please': 'a flat hand circling on the chest',
+    'sorry': 'a fist circling on the chest',
+    'excuse me': 'fingertips of one hand brushing across the other palm',
+    'yes': 'a fist nodding up and down',
+    'no': 'index and middle fingers snapping closed onto the thumb',
+    'i love you': 'thumb, index and pinky extended in the ILY handshape',
+    'good': 'one flat hand touching the lips, moving forward onto the other palm',
+    'bad': 'fingers touching the lips, then the hand flips palm-down',
+    'help': 'a fist resting on an open palm, both lifting slightly',
+    'stop': 'the edge of one hand chopping down onto the other palm',
+    'wait': 'both open hands held up with fingers spread, palms forward',
+    'come': 'an index finger curling toward the signer',
+    'go': 'index fingers pointing forward, moving away',
+    'eat': 'fingertips of a closed hand tapping the mouth',
+    'drink': 'a thumb tipping toward the mouth like a cup',
+    'water': 'a W handshape — index, middle and ring fingers up — tapping the chin',
+    'food': 'fingertips of a closed hand tapping the mouth twice',
+    'name': 'index and middle fingers of both hands crossing in an X',
+    'what': 'an index finger sliding across the open palm',
+    'where': 'an index finger wagging side to side',
+    'who': 'a thumb tracing the chin under a closed fist',
+    'why': 'a Y handshape at the forehead rocking side to side',
+    'when': 'an index finger circling around the other raised index finger',
+    'how': 'knuckles of both hands pressed together, rolling outward',
+    'how are you': 'both hands flipping from palms-down to palms-up',
+    'how much': 'loose fists tapping thumbs against index fingers',
+    'money': 'fingertips tapping the open palm',
+    'deaf': 'an index finger touching the ear, then the mouth',
+    'sign language': 'both hands alternating small circles at the chest',
+    'walk': 'two flat hands alternating forward steps like walking feet',
+    'run': 'L-shaped index and thumb pumping forward',
+    'sit': 'index and middle fingers of one hand bent over the other hand',
+    'stand': 'index and middle fingers standing on the other palm',
+    'mother': 'the thumb of an open hand touching the chin',
+    'father': 'the thumb of an open hand touching the forehead',
+    'child': 'a flat hand patting downward at child height',
+    'baby': 'both arms cradled as if rocking a baby',
+    'friend': 'index fingers of both hands hooking together',
+    'family': 'both hands in F shapes circling into a joined ring',
+    'happy': 'open hands brushing upward on the chest',
+    'sad': 'open hands drooping down in front of the face',
+    'angry': 'clawed fingers pulling away from the face',
+    'love': 'both arms crossed over the chest in a hug',
+    'want': 'open clawed hands pulling toward the signer',
+    'need': 'an X handshape — bent index finger — pressing downward',
+    'understand': 'an index finger flicking upward beside the forehead',
+    'my name is': 'index and middle fingers tapping the other flat hand',
+    'sick': 'middle fingers of both hands touching forehead and stomach',
+    'doctor': 'two fingers tapping the pulse at the wrist',
+    'hospital': 'index and middle fingers drawing a cross on the upper arm',
+    'school': 'one flat hand clapping down onto the other palm',
+    'book': 'both hands opening like a book',
+    'work': 'a fist tapping down onto the other fist',
+    'home': 'fingertips of a closed hand touching the cheek',
+    'phone': 'thumb and pinky extended, held at the ear',
+    'call': 'thumb and pinky extended, held at the ear',
+    'sleep': 'an open hand drawing down over closing eyes',
+    'kombi': 'a flat hand roof shape over a fist, like a minibus taxi',
+    'bus': 'a flat hand roof shape over a fist, like a bus',
+    'car': 'both fists gripping an invisible steering wheel',
+    'rain': 'open fingers wiggling downward like falling rain',
+    'sun': 'a circle drawn above the head',
+    'hot': 'an open hand fanning the face',
+    'cold': 'both fists shaking at the shoulders, shivering',
+    'hungry': 'a C handshape sliding down the chest',
+    'thirsty': 'an index finger sliding down the throat',
+    'sadza': 'fingers of a closed hand rolling as if moulding sadza',
+    'toilet': 'a T handshape shaken side to side',
+    'time': 'an index finger tapping the wrist where a watch sits',
+    'today': 'both Y handshapes dipping down together',
+    'tomorrow': 'a thumb at the cheek arcing forward',
+    'yesterday': 'a thumb at the cheek arcing backward',
+    'morning': 'an arm rising like the sun over the other forearm',
+    'night': 'one flat hand arcing down over the other arm',
+    'week': 'an index finger sliding across the open palm',
+    'welcome': 'both hands open, pulling toward the chest in welcome',
+    'god bless you': 'one hand raised, fingers spread, lowering in blessing',
+    'see you later': 'an index finger pointing at the eye, then outward',
+    'fine': 'a thumbs-up hand tapping the chest',
+    'okay': 'thumb and index forming an O, other fingers extended',
+    'maybe': 'both open palms seesawing up and down',
+    'me': 'an index finger pointing at the chest',
+    'you': 'an index finger pointing forward at the other person',
+    'cry': 'index fingers tracing tears down the cheeks',
+    'afraid': 'open hands flicking outward from the chest',
+    'pay': 'fingertips of one hand sliding off the other palm forward',
+    'write': 'one hand writing on the other open palm',
+    'read': 'eyes following an open palm like a page',
+    'look': 'index and middle fingers pointing at the eyes, then outward',
+    'give': 'a fist or flat hand extending forward from the body',
+    'finish': 'both hands flicking open from closed fists, palms out',
+    'learn': 'fingertips picking information off the palm to the forehead',
+    'teacher': 'fingertips picking off the palm forward, then hands moving down in the person sign',
+    'student': 'fingertips picking off the palm to the forehead, then the person sign',
+    'ambulance': 'an open hand rotating like a siren light',
+    'police': 'a C handshape touching the chest where a badge sits',
+    'fire': 'open fingers wiggling upward like flames',
+    'danger': 'a thumb tapping the shoulder then moving forward sharply',
+    'accident': 'both fists colliding in front of the chest',
+    'prayer': 'both palms pressed together',
+    'church': 'a C handshape tapping the back of the other hand',
+    'market': 'one flat hand moving under the other in a selling motion',
+    'village': 'fingertips of both hands joined in a roof shape',
+    'town': 'fingertips of both hands joined in a roof shape',
+    'city': 'fingertips of both hands joined in a roof shape, larger',
+    'road': 'both flat hands pointing forward side by side like lanes',
+    'i do not understand': 'an index finger flicking down beside the forehead, with head shake',
+    'i need help': 'a fist resting on an open palm, both lifting',
+    'what is your name': 'index and middle fingers crossing in an X with eyebrows furrowed',
+  };
 
   Future<Uint8List?> _generateImage(String apiKey, String prompt) async {
     for (final name in _imageModelNames) {
@@ -956,11 +1384,9 @@ NOTE: <why it was unclear>
 ''';
 
     var sawQuota = false;
-    final ordered = <String>[
-      ?_workingModel,
-      ..._modelNames.where((m) => m != _workingModel),
-    ];
-    for (final name in ordered) {
+    // Final session transcript — accuracy-first order; the pro entries
+    // fall through to the flash list automatically if unavailable.
+    for (final name in _accurateModelNames) {
       final res = await _restGenerate(apiKey, name, {
         'contents': [
           {
